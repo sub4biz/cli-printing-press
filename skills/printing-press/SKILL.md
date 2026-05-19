@@ -730,7 +730,117 @@ Before new research:
 
    The prompt forces the user to acknowledge the version delta and explicitly accept (or refuse) re-validation. Skip it entirely on first generation, on same-version regenerations, or when no prior manifest exists.
 
-   If no CLI exists in the library and no lock is active, skip this step and proceed normally.
+   If no CLI exists in the local library and no lock is active, run the **Public-library check** below before proceeding to Phase 1.
+
+   #### Public-library check (registry.json)
+
+   The local library check above only sees CLIs this machine has already printed. A user on a fresh checkout — or one who typed a slightly different name than the published slug (`Slack` vs `slack-bot`, `Cal` vs `cal-com`), or who described what they wanted in their own words (`Hacker News reader`, `Notion clone`, `prediction market`) — will miss CLIs that already exist in the public library. Scan `mvanhorn/printing-press-library/registry.json` to catch those cases before Phase 1 research begins (the expensive 30-60-minute portion of the pipeline).
+
+   **Skip this check entirely when:**
+   - The local-library check above already prompted (mutual exclusion — do not double-ask).
+   - `BROWSER_SNIFF_TARGET_URL` is set (the user is building a from-website CLI; the registry indexes API CLIs and naming collisions are unlikely and intentional).
+   - The user passed `--har <path>` with an explicit `--name <api>` for a private capture.
+
+   **Fetch the registry.** Match the pattern `/printing-press-import` and `/printing-press-reprint` already use:
+
+   ```bash
+   REGISTRY=$(mktemp)
+   if ! gh api -H "Accept: application/vnd.github.v3.raw" \
+        repos/mvanhorn/printing-press-library/contents/registry.json \
+        > "$REGISTRY" 2>/dev/null; then
+     echo "Public-library check skipped: registry.json unreachable. Proceeding to Phase 1."
+     rm -f "$REGISTRY"
+     REGISTRY=""
+   fi
+   ```
+
+   Do not block on a network failure. After step 4 finishes, clean up the tempfile only if the fetch succeeded: `[ -n "$REGISTRY" ] && rm -f "$REGISTRY"`. The failure branch above already removed it and set `REGISTRY=""`, so an unconditional `rm -f "$REGISTRY"` would run `rm -f ""`.
+
+   **Read the registry and reason about matches** — do not gate on string equality alone. The file is small (~88 KB, ~135 entries today); read it directly and use judgment. Each entry has fields `name` (slug), `category`, `api` (brand display), `description`, `path`, `printer`.
+
+   The user's argument may arrive in many shapes, and only some are catchable by deterministic match:
+
+   - **Slug or near-slug** — `Notion`, `notion-cli`, `notion-pp-cli`
+   - **Brand with punctuation** — `Cal.com`, `Customer.io`, `Archive.today`, `Trigger.dev`
+   - **Concept or category** — `Hacker News reader`, `Notion clone`, `prediction market`, `prediction-market CLI`
+   - **Adjacent product** — `Polymarket` when the registry has `kalshi` (peer prediction market)
+   - **Genuinely novel** — no useful overlap
+
+   Classify the best match at three confidence levels and act only on the top two:
+
+   - **High** — same product under a different name (slug variant, brand vs slug form, `-cli`/`-pp-cli` suffix variant, well-known alias). Examples: `Cal.com` ↔ `cal-com`, `Notion` ↔ `notion-cli`, `slack` ↔ `slack-bot`.
+   - **Medium** — same category and overlapping function; a reasonable user would want to know before building. Examples: `prediction market` finds `kalshi`, `Hacker News reader` finds `hackernews`, `Polymarket` surfaces `kalshi` as a peer.
+   - **Low** — vaguely adjacent (e.g. "payment gateway" finding every payment-related CLI). Skip silently — false-positive prompts get dismissed reflexively at this gate.
+
+   Resist over-matching on `description` keywords. Most descriptions mention several adjacent concepts; matching liberally on description text produces noise. Use the description to *confirm* a name-or-category candidate, not to *discover* candidates from scratch.
+
+   **Combo CLIs.** When `SOURCE_PRIORITY` is set (from the Multi-Source Priority Gate above), skip the single-source High/Medium/No-match branches below. Classify matches per source, then present a single combined prompt rather than asking N times. For combo runs the existing single-source CLIs are usually *informational* — the user came here to build a combo, so the recommended default is to continue with the combo rather than reprint a component standalone.
+
+   **Cap displayed reprint options at 2 across all sources combined** so the prompt fits the 4-option `AskUserQuestion` limit (2 reprints + continue + abort). Pick the 2 best candidates by judgment in this order: (1) High over Medium, (2) primary-source over secondary-source (the first entry in `SOURCE_PRIORITY` wins ties), (3) canonical slug over variant. If additional matches exist beyond the displayed 2, append "(plus N other source matches)" to the prompt body so the user knows the list is truncated. Omit sources with no match rather than listing them as empty rows. If no source has any match at High or Medium, print nothing and proceed to Phase 1.
+
+   > Found matches across the sources you listed:
+   >
+   > - **`<source1>`**: `<entry1.name>` (`<entry1.api>`) [High] — same product as `<source1>`
+   > - **`<source2>`**: `<entry2.name>` (`<entry2.api>`) [Medium] — similar/adjacent
+   >
+   > This is informational — these components already exist as single-source CLIs. Continue building the combo, switch to reprinting one standalone, or abort?
+
+   Options:
+   1. **Continue with the combo as planned (recommended)** — the combo itself is the value-add; proceed to Phase 1 with all sources.
+   2. **Reprint `<entry1.name>` standalone instead** — invoke `/printing-press-reprint <entry1.name>` (abandons the combo for now).
+   3. **Reprint `<entry2.name>` standalone instead** — same, for the second candidate.
+   4. **Abort** — stop here.
+
+   The `[High]` / `[Medium]` tags surface the confidence so the user can distinguish "this is literally the thing you named" from "this is adjacent." Tag in the bullet, not the option label, to keep options scannable.
+
+   **Single-source CLIs.** When `SOURCE_PRIORITY` is not set, use the branches below.
+
+   **High match — prompt strongly.** Under Claude Code, use `AskUserQuestion`; under another harness, use the equivalent native prompt primitive. The option set is the same either way.
+
+   > Found **`<entry.api>`** in the public library (printed by **@`<entry.printer>`**, path `<entry.path>`).
+   >
+   > `<entry.description>`
+   >
+   > URL: `https://github.com/mvanhorn/printing-press-library/tree/main/<entry.path>`
+   >
+   > This CLI already exists. What would you like to do?
+
+   Options:
+   1. **Reprint with the current Printing Press (recommended)** — end this run and invoke `/printing-press-reprint <entry.name>`. That skill pulls the existing CLI, carries prior research and post-publish patches into reconciliation, and regenerates under the current binary. Almost always the right choice when a user discovers the CLI exists.
+   2. **Continue and build a fresh one anyway** — proceed with the current run from scratch. Rare; appropriate only for a deliberate fork or variant.
+   3. **Abort** — stop here.
+
+   **Multiple High matches — present each candidate, do not use the Medium-match phrasing.** Rare — typically only happens when the user's argument is ambiguous between siblings like `slack` and `slack-bot`. Cap displayed candidates at 2 to stay within the 4-option prompt limit alongside continue/abort. If 3+ High candidates somehow qualify, pick the 2 best by judgment (typically the canonical slug match plus the next-most-likely alternative) and note "(plus N other close matches)" in the prompt body so the user knows the list is truncated.
+
+   > Found multiple matches for **`<api>`** in the public library — each appears to be the same product under a different name:
+   >
+   > - **`<entry1.name>`** (`<entry1.api>`) — `<entry1.description>`
+   > - **`<entry2.name>`** (`<entry2.api>`) — `<entry2.description>`
+   >
+   > Pick one to reprint, or continue/abort.
+
+   Options:
+   1. **Reprint `<entry1.name>`** — invoke `/printing-press-reprint <entry1.name>`.
+   2. **Reprint `<entry2.name>`** — same, for the second candidate.
+   3. **Continue and build a fresh one anyway** — rare; appropriate only for a deliberate fork or variant.
+   4. **Abort** — stop here.
+
+   **Medium match — present alternatives.** Cap candidates at 2 to stay within the 4-option prompt limit alongside continue/abort.
+
+   > Found similar entries in the public library that don't exactly match `<api>` but may overlap:
+   >
+   > - **`<entry1.name>`** (`<entry1.api>`) — `<entry1.description>`
+   > - **`<entry2.name>`** (`<entry2.api>`) — `<entry2.description>`
+   >
+   > Continue with `<api>` as planned, or reprint one of these instead?
+
+   Options:
+   1. **Continue with `<api>` as planned** — proceed to Phase 1.
+   2. **Reprint `<entry1.name>` instead** — invoke `/printing-press-reprint <entry1.name>`.
+   3. **Reprint `<entry2.name>` instead** — same, for the second candidate.
+   4. **Abort** — stop here.
+
+   **No High or Medium match:** print nothing, proceed to Phase 1.
 
 5. **API Key Gate** — Check whether this API requires authentication, then handle accordingly.
 
